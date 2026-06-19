@@ -1,0 +1,138 @@
+# -*- coding: utf-8 -*-
+"""
+Съхранение в SQLite (Фаза 4).
+
+Държи състоянието между изпълненията — кои статии вече сме виждали и кои
+двойки между източници вече са отбелязани като съвпадение. Заменя крехкото
+сравняване на JSON файлове (виж README, „Взети решения“).
+
+Две таблици:
+  articles  — по един ред на уникална статия (дедупликация по url).
+              embedding пазим като JSON масив (векторът от OpenAI).
+  matches   — по един ред на съвпадаща двойка между РАЗЛИЧНИ източници.
+              Двойката се пази нормализирана (по-малкото id първо), за да
+              може UNIQUE да хване и двата реда на подреждане.
+"""
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Базата живее в data/ (извън Git — .gitignore изключва *.db).
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cricket.db"
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS articles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT NOT NULL,
+    headline   TEXT NOT NULL,
+    url        TEXT NOT NULL UNIQUE,
+    published  TEXT,              -- ISO дата от емисията (може да липсва)
+    embedding  TEXT,              -- JSON масив с вектора
+    first_seen TEXT NOT NULL      -- ISO кога за пръв път сме видели статията
+);
+
+CREATE TABLE IF NOT EXISTS matches (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_a_id INTEGER NOT NULL,
+    article_b_id INTEGER NOT NULL,
+    similarity   REAL NOT NULL,
+    matched_at   TEXT NOT NULL,
+    UNIQUE(article_a_id, article_b_id),
+    FOREIGN KEY(article_a_id) REFERENCES articles(id),
+    FOREIGN KEY(article_b_id) REFERENCES articles(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_articles_first_seen ON articles(first_seen);
+CREATE INDEX IF NOT EXISTS idx_articles_published  ON articles(published);
+"""
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def connect(db_path=DB_PATH):
+    """Отваря връзка към базата и подсигурява схемата."""
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def existing_urls(conn):
+    """Множество от вече видените URL-и — за бърза проверка кое е ново."""
+    rows = conn.execute("SELECT url FROM articles").fetchall()
+    return {r["url"] for r in rows}
+
+
+def insert_article(conn, art, embedding):
+    """Вкарва нова статия (с вектора) и връща нейното id.
+
+    При сблъсък по url не дублира — връща id-то на съществуващия ред.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO articles "
+        "(source, headline, url, published, embedding, first_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (art["source"], art["headline"], art["url"], art.get("published"),
+         json.dumps(embedding), _now_iso()),
+    )
+    if cur.lastrowid and cur.rowcount:
+        return cur.lastrowid
+    row = conn.execute("SELECT id FROM articles WHERE url = ?",
+                       (art["url"],)).fetchone()
+    return row["id"]
+
+
+def recent_articles(conn, window_hours):
+    """Статии от последния прозорец, които имат вектор.
+
+    „Скорошна“ се мери по published, а ако липсва — по first_seen
+    (COALESCE), за да не изпускаме статии без дата от емисията.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - window_hours * 3600
+    rows = conn.execute(
+        "SELECT id, source, headline, url, published, embedding, first_seen "
+        "FROM articles WHERE embedding IS NOT NULL"
+    ).fetchall()
+
+    recent = []
+    for r in rows:
+        stamp = r["published"] or r["first_seen"]
+        try:
+            ts = datetime.fromisoformat(stamp).timestamp()
+        except (ValueError, TypeError):
+            ts = None
+        if ts is None or ts >= cutoff:
+            recent.append({
+                "id": r["id"],
+                "source": r["source"],
+                "headline": r["headline"],
+                "url": r["url"],
+                "embedding": json.loads(r["embedding"]),
+            })
+    return recent
+
+
+def record_match(conn, a_id, b_id, similarity):
+    """Записва двойка съвпадение (нормализирана). True, ако е нова."""
+    lo, hi = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO matches "
+        "(article_a_id, article_b_id, similarity, matched_at) "
+        "VALUES (?, ?, ?, ?)",
+        (lo, hi, float(similarity), _now_iso()),
+    )
+    return cur.rowcount > 0
+
+
+def counts(conn):
+    """Брой статии и съвпадения — за кратък отчет."""
+    a = conn.execute("SELECT COUNT(*) AS n FROM articles").fetchone()["n"]
+    m = conn.execute("SELECT COUNT(*) AS n FROM matches").fetchone()["n"]
+    return a, m
