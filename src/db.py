@@ -25,13 +25,18 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cricket.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS articles (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    source     TEXT NOT NULL,
-    headline   TEXT NOT NULL,
-    url        TEXT NOT NULL UNIQUE,
-    published  TEXT,              -- ISO дата от емисията (може да липсва)
-    embedding  TEXT,              -- JSON масив с вектора
-    first_seen TEXT NOT NULL      -- ISO кога за пръв път сме видели статията
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,
+    headline        TEXT NOT NULL,
+    url             TEXT NOT NULL UNIQUE,
+    published       TEXT,          -- ISO дата от емисията (може да липсва)
+    embedding       TEXT,          -- JSON масив с вектора
+    first_seen      TEXT NOT NULL, -- ISO кога за пръв път сме видели статията
+    -- Тяло на статията (Фаза 3) — пълни се само за статии в съвпадение.
+    body            TEXT,          -- чистият текст; NULL при провал
+    body_status     TEXT,          -- ok | 403 | empty | timeout | unresolved | http_XXX | error
+    body_url        TEXT,          -- разрешеният истински URL, от който теглим
+    body_fetched_at TEXT           -- ISO кога сме опитали извличането
 );
 
 CREATE TABLE IF NOT EXISTS matches (
@@ -54,6 +59,24 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+# Колони, добавени след първоначалната схема (Фаза 3). За вече съществуваща
+# база CREATE TABLE IF NOT EXISTS не ги добавя — затова ги долепяме с ALTER.
+_BODY_COLUMNS = [
+    ("body", "TEXT"),
+    ("body_status", "TEXT"),
+    ("body_url", "TEXT"),
+    ("body_fetched_at", "TEXT"),
+]
+
+
+def _migrate(conn):
+    """Долепя липсващите колони към стара база (идемпотентно)."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(articles)")}
+    for col, decl in _BODY_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {col} {decl}")
+
+
 def connect(db_path=DB_PATH):
     """Отваря връзка към базата и подсигурява схемата."""
     db_path = Path(db_path)
@@ -61,6 +84,7 @@ def connect(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -136,3 +160,54 @@ def counts(conn):
     a = conn.execute("SELECT COUNT(*) AS n FROM articles").fetchone()["n"]
     m = conn.execute("SELECT COUNT(*) AS n FROM matches").fetchone()["n"]
     return a, m
+
+
+# ── Тела на статиите (Фаза 3) ──────────────────────────────────────────────
+
+# Подзаявка: id-тата на всички статии, които участват в поне едно съвпадение.
+_MATCHED_IDS = ("SELECT article_a_id FROM matches "
+                "UNION SELECT article_b_id FROM matches")
+
+
+def articles_needing_body(conn, retry_failed=False):
+    """Статии в съвпадение, на които още не сме извличали тялото.
+
+    По подразбиране връща само НЕОПИТВАНИТЕ (body_status IS NULL) — така едно
+    тяло никога не се тегли повторно. С retry_failed=True връща и провалените
+    (status != 'ok') — за повторен опит, напр. след добавяне на fetch-услуга.
+    """
+    if retry_failed:
+        cond = "(body_status IS NULL OR body_status != 'ok')"
+    else:
+        cond = "body_status IS NULL"
+    rows = conn.execute(
+        f"SELECT id, source, headline, url FROM articles "
+        f"WHERE id IN ({_MATCHED_IDS}) AND {cond} "
+        f"ORDER BY source, id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_body(conn, article_id, body, status, resolved_url):
+    """Записва резултата от извличането (успех или провал)."""
+    conn.execute(
+        "UPDATE articles SET body = ?, body_status = ?, body_url = ?, "
+        "body_fetched_at = ? WHERE id = ?",
+        (body, status, resolved_url, _now_iso(), article_id),
+    )
+
+
+def body_report(conn):
+    """Разбивка по източник: брой статии в съвпадение по статус на тялото.
+
+    Връща {source: {status: count}}. Подрежда се по източник в извикващия.
+    """
+    rows = conn.execute(
+        f"SELECT source, COALESCE(body_status, 'не-опитан') AS status, "
+        f"COUNT(*) AS n FROM articles WHERE id IN ({_MATCHED_IDS}) "
+        f"GROUP BY source, status"
+    ).fetchall()
+    report = {}
+    for r in rows:
+        report.setdefault(r["source"], {})[r["status"]] = r["n"]
+    return report
