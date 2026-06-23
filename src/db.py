@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS matches (
     FOREIGN KEY(article_b_id) REFERENCES articles(id)
 );
 
+CREATE TABLE IF NOT EXISTS combined_articles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id   INTEGER NOT NULL UNIQUE,  -- по едно обединение на двойка (идемпотентно)
+    headline   TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    model      TEXT NOT NULL,            -- кой LLM е написал материала
+    created_at TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'draft',
+    FOREIGN KEY(match_id) REFERENCES matches(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_articles_first_seen ON articles(first_seen);
 CREATE INDEX IF NOT EXISTS idx_articles_published  ON articles(published);
 """
@@ -211,3 +222,55 @@ def body_report(conn):
     for r in rows:
         report.setdefault(r["source"], {})[r["status"]] = r["n"]
     return report
+
+
+# ── Обединяване (Фаза 5) ────────────────────────────────────────────────────
+
+# Двойка е готова за обединяване, когато И ДВЕТЕ статии имат успешно тяло.
+_BOTH_BODIES_OK = "a.body_status = 'ok' AND b.body_status = 'ok'"
+
+
+def pairs_to_combine(conn):
+    """Съвпадащи двойки с налични тела на ДВЕТЕ статии, още необединени.
+
+    Двойките без тяло (напр. остатъка от Фаза 3) се отсяват тук — затова
+    combine.py никога не им праща заявка.
+    """
+    rows = conn.execute(
+        f"SELECT m.id AS match_id, m.similarity, "
+        f"  a.source AS a_source, a.headline AS a_headline, a.body AS a_body, "
+        f"  b.source AS b_source, b.headline AS b_headline, b.body AS b_body "
+        f"FROM matches m "
+        f"JOIN articles a ON a.id = m.article_a_id "
+        f"JOIN articles b ON b.id = m.article_b_id "
+        f"WHERE {_BOTH_BODIES_OK} "
+        f"  AND m.id NOT IN (SELECT match_id FROM combined_articles) "
+        f"ORDER BY m.id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pairs_missing_body(conn):
+    """Брой необединени двойки, които прескачаме заради липсващо тяло."""
+    return conn.execute(
+        f"SELECT COUNT(*) AS n FROM matches m "
+        f"JOIN articles a ON a.id = m.article_a_id "
+        f"JOIN articles b ON b.id = m.article_b_id "
+        f"WHERE NOT ({_BOTH_BODIES_OK}) "
+        f"  AND m.id NOT IN (SELECT match_id FROM combined_articles)"
+    ).fetchone()["n"]
+
+
+def save_combined(conn, match_id, headline, body, model):
+    """Записва обединения материал (статус 'draft'). Идемпотентно по match_id."""
+    conn.execute(
+        "INSERT OR IGNORE INTO combined_articles "
+        "(match_id, headline, body, model, created_at) VALUES (?, ?, ?, ?, ?)",
+        (match_id, headline, body, model, _now_iso()),
+    )
+
+
+def combined_count(conn):
+    """Общ брой обединени материали в базата."""
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM combined_articles").fetchone()["n"]
