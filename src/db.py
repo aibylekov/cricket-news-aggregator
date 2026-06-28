@@ -40,24 +40,31 @@ CREATE TABLE IF NOT EXISTS articles (
 );
 
 CREATE TABLE IF NOT EXISTS matches (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    article_a_id INTEGER NOT NULL,
-    article_b_id INTEGER NOT NULL,
-    similarity   REAL NOT NULL,
-    matched_at   TEXT NOT NULL,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    article_a_id   INTEGER NOT NULL,
+    article_b_id   INTEGER NOT NULL,
+    similarity     REAL NOT NULL,
+    matched_at     TEXT NOT NULL,
+    -- Състояние при обединяване (Фаза 6): NULL = необработена,
+    -- 'combined' = обединена в събитие, 'duplicate' = прескочена като дубликат.
+    combine_status TEXT,
     UNIQUE(article_a_id, article_b_id),
     FOREIGN KEY(article_a_id) REFERENCES articles(id),
     FOREIGN KEY(article_b_id) REFERENCES articles(id)
 );
 
 CREATE TABLE IF NOT EXISTS combined_articles (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_id   INTEGER NOT NULL UNIQUE,  -- по едно обединение на двойка (идемпотентно)
-    headline   TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    model      TEXT NOT NULL,            -- кой LLM е написал материала
-    created_at TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'draft',
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id     INTEGER NOT NULL UNIQUE,  -- по едно обединение на двойка (идемпотентно)
+    headline     TEXT NOT NULL,
+    body         TEXT NOT NULL,            -- чисто тяло, без маркери (Фаза 6 пост-обработка)
+    editor_notes TEXT,                     -- блокът EDITOR NOTES, държан отделно от тялото
+    source_a_url TEXT,                     -- двата източника — за проверка от ревюъра
+    source_b_url TEXT,
+    model        TEXT NOT NULL,            -- кой LLM е написал материала
+    created_at   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'draft',
+    emailed_at   TEXT,                     -- ISO кога е пратен за ревю (NULL = непратен)
     FOREIGN KEY(match_id) REFERENCES matches(id)
 );
 
@@ -70,22 +77,34 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-# Колони, добавени след първоначалната схема (Фаза 3). За вече съществуваща
-# база CREATE TABLE IF NOT EXISTS не ги добавя — затова ги долепяме с ALTER.
-_BODY_COLUMNS = [
-    ("body", "TEXT"),
-    ("body_status", "TEXT"),
-    ("body_url", "TEXT"),
-    ("body_fetched_at", "TEXT"),
-]
+# Колони, добавени след първоначалната схема. За вече съществуваща база
+# CREATE TABLE IF NOT EXISTS не ги добавя — затова ги долепяме с ALTER.
+_MIGRATIONS = {
+    "articles": [               # Фаза 3 — тела
+        ("body", "TEXT"),
+        ("body_status", "TEXT"),
+        ("body_url", "TEXT"),
+        ("body_fetched_at", "TEXT"),
+    ],
+    "matches": [                # Фаза 6 — състояние при обединяване
+        ("combine_status", "TEXT"),
+    ],
+    "combined_articles": [      # Фаза 6 — EDITOR NOTES, източници, имейл статус
+        ("editor_notes", "TEXT"),
+        ("source_a_url", "TEXT"),
+        ("source_b_url", "TEXT"),
+        ("emailed_at", "TEXT"),
+    ],
+}
 
 
 def _migrate(conn):
     """Долепя липсващите колони към стара база (идемпотентно)."""
-    have = {r["name"] for r in conn.execute("PRAGMA table_info(articles)")}
-    for col, decl in _BODY_COLUMNS:
-        if col not in have:
-            conn.execute(f"ALTER TABLE articles ADD COLUMN {col} {decl}")
+    for table, cols in _MIGRATIONS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols:
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 def connect(db_path=DB_PATH):
@@ -224,53 +243,128 @@ def body_report(conn):
     return report
 
 
-# ── Обединяване (Фаза 5) ────────────────────────────────────────────────────
+# ── Обединяване и дедупликация на събития (Фаза 5/6) ─────────────────────────
 
 # Двойка е готова за обединяване, когато И ДВЕТЕ статии имат успешно тяло.
 _BOTH_BODIES_OK = "a.body_status = 'ok' AND b.body_status = 'ok'"
 
+# Двойка е „необработена“, когато няма combine_status и още не е обединявана.
+# (Двойната проверка пази и legacy редове отпреди combine_status.)
+_UNPROCESSED = ("m.combine_status IS NULL "
+                "AND m.id NOT IN (SELECT match_id FROM combined_articles)")
+
 
 def pairs_to_combine(conn):
-    """Съвпадащи двойки с налични тела на ДВЕТЕ статии, още необединени.
+    """Необработени съвпадащи двойки с налични тела на ДВЕТЕ статии.
 
-    Двойките без тяло (напр. остатъка от Фаза 3) се отсяват тук — затова
-    combine.py никога не им праща заявка.
+    Връща и id-тата, разрешените URL-и и embeddings на двете статии — нужни
+    за дедупликацията на събития и за имейла, без допълнителни заявки.
     """
     rows = conn.execute(
         f"SELECT m.id AS match_id, m.similarity, "
-        f"  a.source AS a_source, a.headline AS a_headline, a.body AS a_body, "
-        f"  b.source AS b_source, b.headline AS b_headline, b.body AS b_body "
+        f"  a.id AS a_id, a.source AS a_source, a.headline AS a_headline, "
+        f"  a.body AS a_body, a.embedding AS a_emb, "
+        f"  COALESCE(a.body_url, a.url) AS a_url, "
+        f"  b.id AS b_id, b.source AS b_source, b.headline AS b_headline, "
+        f"  b.body AS b_body, b.embedding AS b_emb, "
+        f"  COALESCE(b.body_url, b.url) AS b_url "
         f"FROM matches m "
         f"JOIN articles a ON a.id = m.article_a_id "
         f"JOIN articles b ON b.id = m.article_b_id "
-        f"WHERE {_BOTH_BODIES_OK} "
-        f"  AND m.id NOT IN (SELECT match_id FROM combined_articles) "
+        f"WHERE {_BOTH_BODIES_OK} AND {_UNPROCESSED} "
         f"ORDER BY m.id"
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def count_pairs_missing_body(conn):
-    """Брой необединени двойки, които прескачаме заради липсващо тяло."""
+    """Брой необработени двойки, които прескачаме заради липсващо тяло."""
     return conn.execute(
         f"SELECT COUNT(*) AS n FROM matches m "
         f"JOIN articles a ON a.id = m.article_a_id "
         f"JOIN articles b ON b.id = m.article_b_id "
-        f"WHERE NOT ({_BOTH_BODIES_OK}) "
-        f"  AND m.id NOT IN (SELECT match_id FROM combined_articles)"
+        f"WHERE NOT ({_BOTH_BODIES_OK}) AND {_UNPROCESSED}"
     ).fetchone()["n"]
 
 
-def save_combined(conn, match_id, headline, body, model):
+def published_event_embeddings(conn, window_hours):
+    """Embeddings на статиите от вече обединени („публикувани“) събития.
+
+    Само скорошните (по published, иначе first_seen — прозорец window_hours),
+    защото дубликат се мери срещу актуалните събития. Това е котвата, срещу
+    която проверяваме всяка нова двойка преди да я обединим.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - window_hours * 3600
+    rows = conn.execute(
+        "SELECT DISTINCT a.id, a.embedding, a.published, a.first_seen "
+        "FROM articles a WHERE a.embedding IS NOT NULL AND a.id IN ("
+        "  SELECT article_a_id FROM matches WHERE combine_status = 'combined' "
+        "  UNION "
+        "  SELECT article_b_id FROM matches WHERE combine_status = 'combined')"
+    ).fetchall()
+
+    out = []
+    for r in rows:
+        stamp = r["published"] or r["first_seen"]
+        try:
+            ts = datetime.fromisoformat(stamp).timestamp()
+        except (ValueError, TypeError):
+            ts = None
+        if ts is None or ts >= cutoff:
+            out.append({"id": r["id"], "embedding": json.loads(r["embedding"])})
+    return out
+
+
+def mark_combine_status(conn, match_id, status):
+    """Маркира двойката като 'combined' или 'duplicate'."""
+    conn.execute("UPDATE matches SET combine_status = ? WHERE id = ?",
+                 (status, match_id))
+
+
+def save_combined(conn, match_id, headline, body, model,
+                  editor_notes=None, source_a_url=None, source_b_url=None):
     """Записва обединения материал (статус 'draft'). Идемпотентно по match_id."""
     conn.execute(
         "INSERT OR IGNORE INTO combined_articles "
-        "(match_id, headline, body, model, created_at) VALUES (?, ?, ?, ?, ?)",
-        (match_id, headline, body, model, _now_iso()),
+        "(match_id, headline, body, editor_notes, source_a_url, source_b_url, "
+        " model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (match_id, headline, body, editor_notes, source_a_url, source_b_url,
+         model, _now_iso()),
     )
+
+
+def combined_to_email(conn):
+    """Обединени материали, които още не са пращани за ревю (emailed_at IS NULL)."""
+    rows = conn.execute(
+        "SELECT id, match_id, headline, body, editor_notes, "
+        "  source_a_url, source_b_url "
+        "FROM combined_articles WHERE emailed_at IS NULL ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_emailed(conn, combined_id):
+    """Маркира материала като пратен — за да не се праща повторно."""
+    conn.execute(
+        "UPDATE combined_articles SET emailed_at = ?, status = 'emailed' "
+        "WHERE id = ?", (_now_iso(), combined_id))
+
+
+def reset_combinations(conn):
+    """САМО ЗА ТЕСТ: изчиства обединените материали и нулира combine_status."""
+    conn.execute("DELETE FROM combined_articles")
+    conn.execute("UPDATE matches SET combine_status = NULL")
+    conn.commit()
 
 
 def combined_count(conn):
     """Общ брой обединени материали в базата."""
     return conn.execute(
         "SELECT COUNT(*) AS n FROM combined_articles").fetchone()["n"]
+
+
+def duplicate_count(conn):
+    """Общ брой двойки, прескочени като дубликат на събитие."""
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM matches WHERE combine_status = 'duplicate'"
+    ).fetchone()["n"]
