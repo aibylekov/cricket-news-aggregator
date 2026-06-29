@@ -376,7 +376,12 @@ def main():
     parser = argparse.ArgumentParser(description="Обединяване + дедупликация (Фаза 6).")
     parser.add_argument("--reset", action="store_true",
                         help="САМО ТЕСТ: трие обединените и нулира combine_status")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="максимум двойки за ОБЕДИНЯВАНЕ този път")
+    parser.add_argument("--send-limit", type=int, default=None,
+                        help="максимум материали за ПРАЩАНЕ този път (напр. 1)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="ревю-имейлите само се логват, не се пращат")
     args = parser.parse_args()
 
     print("\n=== Обединяване + дедупликация + ревю-имейл (Фаза 6) ===\n")
@@ -394,7 +399,8 @@ def main():
 
     # D. Ревю-имейл за новопроизведените (непратени) материали.
     print("\nРевю-имейл:")
-    email_report = notify.send_unsent(conn)
+    email_report = notify.send_unsent(conn, limit=args.send_limit,
+                                      dry_run=args.dry_run)
 
     _print_sample(report["produced"], n=1)
 
@@ -403,7 +409,7 @@ def main():
     print(f"Прескочени (дубликат)   : {report['duplicates']}")
     print(f"Прескочени (без тяло)   : {report['skipped_missing_body']}")
     print(f"Неуспешни (модел/парс)  : {report['failed']}")
-    mode = "пратени" if email_report["configured"] else "would-email (dry-run)"
+    mode = "would-email (dry-run)" if email_report["dry_run"] else "пратени"
     print(f"Имейли ({mode}): "
           f"{email_report['sent'] + email_report['would_send']}")
     print(f"Общо обединени в база    : {db.combined_count(conn)}")
