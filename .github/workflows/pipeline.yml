@@ -1,0 +1,68 @@
+name: Cricket news pipeline
+
+# Разписание: на всеки 15 минути + ръчно пускане от Actions таба.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# Не пускай два конвейера едновременно — сериализира достъпа до базата и push-а.
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+# Нужно за commit-ване на data/cricket.db обратно в хранилището.
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      # Всички тайни идват от GitHub Actions Secrets (Settings → Secrets and
+      # variables → Actions). Никога в кода.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ZYTE_API_KEY: ${{ secrets.ZYTE_API_KEY }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      # Предпазни тавани за едно пускане (Фаза 7) — конфигурируеми тук.
+      MAX_COMBINES_PER_RUN: "10"
+      MAX_SENDS_PER_RUN: "10"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout (с историята, за да можем да push-нем базата)
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        run: python -m src.pipeline
+
+      - name: Persist DB state (commit back)
+        if: always()          # запазваме състоянието дори при частичен провал
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/cricket.db
+          if git diff --cached --quiet; then
+            echo "Няма промени в базата — нищо за commit."
+          else
+            git commit -m "pipeline: persist cricket.db state [skip ci]"
+            git push || (git pull --rebase --autostash && git push)
+          fi
+
+      - name: Alert on failure
+        if: failure()
+        run: python -m src.notify --alert "Cricket pipeline run failed. See the GitHub Actions logs for this run."

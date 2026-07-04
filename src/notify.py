@@ -24,10 +24,15 @@
     `--limit 1` тръгва ТОЧНО един, а останалите остават непратени и недокоснати.
     Безопасен единичен тест преди масово пращане.
 
+Предпазен таван (Фаза 7): без изричен --limit важи MAX_SENDS_PER_RUN (по
+подразбиране 10) — за да не изсипе цял backlog наведнъж при непривзиран run.
+
 Стартиране:
     python -m src.notify --limit 1            # реален единичен тест (1 имейл)
     python -m src.notify --dry-run            # само лог, нищо не се праща
-    python -m src.notify                      # праща всички непратени
+    python -m src.notify --mark-all-sent      # маркира backlog като пратен, БЕЗ пращане
+    python -m src.notify --alert "msg"        # праща имейл-аларма (Фаза 7)
+    python -m src.notify                       # праща до MAX_SENDS_PER_RUN непратени
 """
 
 import argparse
@@ -55,6 +60,17 @@ except ImportError:  # позволява и директно `python src/notify
 
 
 load_dotenv()
+
+# Предпазен таван на пращанията за едно пускане (Фаза 7) — за да не изсипе цял
+# backlog наведнъж при непривзиран run. Конфигурируем през средата.
+DEFAULT_MAX_SENDS = 10
+
+
+def _max_sends():
+    try:
+        return int(os.getenv("MAX_SENDS_PER_RUN", str(DEFAULT_MAX_SENDS)))
+    except ValueError:
+        return DEFAULT_MAX_SENDS
 
 
 def _config():
@@ -112,9 +128,15 @@ def send_unsent(conn, limit=None, dry_run=False):
     configured = is_configured(cfg)
     do_send = configured and not dry_run
 
+    # Ефективен лимит = изричният --limit, иначе предпазният таван за пускане.
     # Срезът определя колко обработваме този път; останалите стоят непокътнати.
-    batch = pending if limit is None else pending[:max(0, limit)]
+    ceiling = _max_sends()
+    effective = ceiling if limit is None else max(0, limit)
+    batch = pending[:effective]
     remaining_untouched = len(pending) - len(batch)
+    if remaining_untouched and limit is None:
+        print(f"  ⚠ предпазен таван: пращаме до {ceiling} този път "
+              f"({remaining_untouched} остават за следващ цикъл)")
 
     sent, would_send, errors = 0, 0, 0
 
@@ -131,7 +153,7 @@ def send_unsent(conn, limit=None, dry_run=False):
             print(f"  ✉ would send → [{cfg['to'] or 'EMAIL_TO?'}] {row['headline']}")
             would_send += 1
         if remaining_untouched:
-            print(f"  … още {remaining_untouched} непратени (извън --limit)")
+            print(f"  … още {remaining_untouched} непратени (извън лимита/тавана)")
         return {"sent": 0, "would_send": would_send, "errors": 0,
                 "configured": configured, "dry_run": True,
                 "pending_total": len(pending), "remaining": len(pending),
@@ -167,25 +189,72 @@ def send_unsent(conn, limit=None, dry_run=False):
             pass
 
     if remaining_untouched:
-        print(f"  … още {remaining_untouched} непратени остават (извън --limit)")
+        print(f"  … още {remaining_untouched} непратени остават (извън лимита/тавана)")
     return {"sent": sent, "would_send": 0, "errors": errors, "configured": True,
             "dry_run": False, "pending_total": len(pending),
             "remaining": len(pending) - sent}
 
 
+def send_alert(message):
+    """Праща кратък имейл-аларма при провал на конвейера (Фаза 7).
+
+    При липсваща SMTP конфигурация само логва (разчита се на вградените
+    известия за провал на GitHub Actions като резерв). Връща True при пращане.
+    """
+    cfg = _config()
+    if not is_configured(cfg):
+        print(f"  (alert dry-run — SMTP не е конфигуриран): {message}")
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = "[cricket-pipeline] ПРОВАЛ на изпълнение"
+    msg["From"] = cfg["from"]
+    msg["To"] = cfg["to"]
+    msg.set_content(message + "\n")
+    try:
+        with smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]),
+                              context=ssl.create_default_context()) as server:
+            server.login(cfg["user"], cfg["password"])
+            server.send_message(msg)
+        print("  ✓ alert изпратен")
+        return True
+    except Exception as ex:
+        print(f"  ✗ alert не се изпрати: {type(ex).__name__}: {ex}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Ревю-имейл доставка (Фаза 6). Безопасен единичен тест: "
+        description="Ревю-имейл доставка (Фаза 6/7). Безопасен единичен тест: "
                     "python -m src.notify --limit 1")
     parser.add_argument("--limit", type=int, default=None,
                         help="максимум материали за пращане в едно пускане "
-                             "(--limit 1 = точно един)")
+                             "(--limit 1 = точно един). Без него важи таванът "
+                             "MAX_SENDS_PER_RUN")
     parser.add_argument("--dry-run", action="store_true",
                         help="само логва „would send“, не праща нищо")
+    parser.add_argument("--mark-all-sent", action="store_true",
+                        help="еднократно: маркира ВСИЧКИ непратени като пратени "
+                             "БЕЗ да ги праща (неутрализира стар backlog)")
+    parser.add_argument("--alert", metavar="MSG", default=None,
+                        help="праща имейл-аларма с това съобщение и излиза")
     args = parser.parse_args()
 
-    print("\n=== Ревю-имейл доставка (Фаза 6) ===\n")
+    if args.alert is not None:
+        print("\n=== Аларма при провал (Фаза 7) ===\n")
+        send_alert(args.alert)
+        return
+
     conn = db.connect()
+
+    if args.mark_all_sent:
+        print("\n=== Неутрализиране на backlog (--mark-all-sent) ===\n")
+        n = db.mark_all_emailed(conn)
+        conn.close()
+        print(f"Маркирани като пратени БЕЗ пращане: {n} материала.")
+        print("От тук нататък тръгват само новите съвпадения.\n")
+        return
+
+    print("\n=== Ревю-имейл доставка (Фаза 6/7) ===\n")
     report = send_unsent(conn, limit=args.limit, dry_run=args.dry_run)
     conn.close()
 

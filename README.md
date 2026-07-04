@@ -213,12 +213,21 @@ cricket-news-aggregator/
 дубликат, 2 без тяло, 0 неуспешни; 27 would-email.** Повторно пускане обединява 0 (идемпотентно). Телата —
 без em dash; всеки запис има EDITOR NOTES + двата източника.
 
-### Фаза 7 — Разписание и хостинг (GitHub Actions)
-- [ ] Целият конвейер като един скрипт (`pipeline.py`)
-- [ ] Работен файл за Actions (cron ~15 мин)
-- [ ] Тайните в Actions Secrets
-- [ ] Запазване на SQLite базата между изпълненията
-- [ ] Аларма при провал
+### Фаза 7 — Разписание и хостинг (GitHub Actions) ✓ завършена
+- [x] Целият конвейер като един скрипт — `src/pipeline.py` (collect → match → extract → combine → notify)
+- [x] Работен файл за Actions — `.github/workflows/pipeline.yml` (cron `*/15 * * * *` + `workflow_dispatch`)
+- [x] Тайните в Actions Secrets (виж списъка по-долу) — никога в кода
+- [x] Запазване на `data/cricket.db` между изпълненията (commit back с `GITHUB_TOKEN`) → нищо не се праща повторно
+- [x] **Предпазни тавани за пускане:** `MAX_COMBINES_PER_RUN` и `MAX_SENDS_PER_RUN` (по подразбиране 10) —
+      избягал цикъл не може да натрупа разход/имейли без надзор; логва се ясно при достигане
+- [x] **Аларма при провал:** имейл (`python -m src.notify --alert "…"`) + вградените известия на Actions;
+      `pipeline.py` излиза с код 1 при необработена грешка
+- [x] **Неутрализиране на backlog:** `python -m src.notify --mark-all-sent` (маркира всички непратени като
+      пратени, БЕЗ да ги праща) — старите тестови материали никога не тръгват
+
+**Тайни за добавяне (Settings → Secrets and variables → Actions → New repository secret):**
+`OPENAI_API_KEY`, `ZYTE_API_KEY`, `EMAIL_FROM`, `EMAIL_TO`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`.
+Базата `data/cricket.db` е сложена в Git като начално състояние (backlog вече е неутрализиран).
 
 ### Фаза 8 — Заздравяване и наблюдение
 - [ ] Изолация на отказите по източник, логове
@@ -228,6 +237,15 @@ cricket-news-aggregator/
 ---
 
 ## Текущ статус
+
+**Фаза 7 завършена (разписание в GitHub Actions).** Целият конвейер е един скрипт `src/pipeline.py`
+(collect → match → extract → combine → notify), пускан от `.github/workflows/pipeline.yml` на всеки 15
+минути (cron) и ръчно (`workflow_dispatch`). Всички тайни идват от Actions Secrets. Състоянието
+`data/cricket.db` се commit-ва обратно след всяко пускане (с `GITHUB_TOKEN`), тъй че оцелява между
+run-овете и нищо не се праща повторно. Предпазни тавани `MAX_COMBINES_PER_RUN` / `MAX_SENDS_PER_RUN`
+(по 10) ограничават разхода и имейлите на пускане; при провал `pipeline.py` излиза с код 1 и се праща
+имейл-аларма. Старият backlog е неутрализиран с `notify --mark-all-sent` (26 материала маркирани без
+пращане), а базата е сложена в Git като начално състояние. Готово за едноседмичния тест без надзор.
 
 **Фаза 6 завършена (ревю-имейл, human-in-the-loop).** Обединяването вече е през **`gpt-5.4-mini`**
 (`src/combine.py`) със синтез-промпта v2; преди заявка телата минават през `clean_body()` (маха bylines,

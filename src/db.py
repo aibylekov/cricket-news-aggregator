@@ -350,6 +350,19 @@ def mark_emailed(conn, combined_id):
         "WHERE id = ?", (_now_iso(), combined_id))
 
 
+def mark_all_emailed(conn):
+    """Маркира ВСИЧКИ непратени материали като пратени, БЕЗ да ги праща.
+
+    Еднократно неутрализиране на стар backlog — старите тестови материали
+    никога не тръгват по имейл. Връща броя маркирани.
+    """
+    cur = conn.execute(
+        "UPDATE combined_articles SET emailed_at = ?, status = 'emailed' "
+        "WHERE emailed_at IS NULL", (_now_iso(),))
+    conn.commit()
+    return cur.rowcount
+
+
 def reset_combinations(conn):
     """САМО ЗА ТЕСТ: изчиства обединените материали и нулира combine_status."""
     conn.execute("DELETE FROM combined_articles")
