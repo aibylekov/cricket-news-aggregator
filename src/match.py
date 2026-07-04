@@ -37,9 +37,11 @@ from dotenv import load_dotenv
 try:
     from . import db
     from .collect import collect_all
+    from .retry import retry_call
 except ImportError:  # позволява и директно `python src/match.py`
     import db
     from collect import collect_all
+    from retry import retry_call
 
 
 EMBED_MODEL = "text-embedding-3-small"
@@ -52,18 +54,24 @@ load_dotenv()
 
 
 def _client():
-    """OpenAI клиент; ясна грешка, ако ключът липсва."""
+    """OpenAI клиент; ясна грешка, ако ключът липсва.
+
+    max_retries=0 — вградените повторения на клиента са изключени, за да е
+    нашият retry (`src/retry.py`) единственият механизъм (с видим лог).
+    """
     from openai import OpenAI
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
             "Липсва OPENAI_API_KEY. Копирай .env.example в .env и сложи ключа.")
-    return OpenAI()
+    return OpenAI(max_retries=0)
 
 
 def embed_headlines(headlines):
     """Embed-ва списък заглавия и връща списък вектори в същия ред.
 
-    Едно пакетно извикване (при нужда — на части от по MAX_BATCH).
+    Едно пакетно извикване (при нужда — на части от по MAX_BATCH). Всяко
+    извикване е обвито в retry за преходни OpenAI грешки (APIConnectionError,
+    RateLimitError, 5xx); AuthenticationError/BadRequestError се провалят веднага.
     """
     if not headlines:
         return []
@@ -71,7 +79,9 @@ def embed_headlines(headlines):
     vectors = []
     for start in range(0, len(headlines), MAX_BATCH):
         chunk = headlines[start:start + MAX_BATCH]
-        resp = client.embeddings.create(model=EMBED_MODEL, input=chunk)
+        resp = retry_call(
+            lambda: client.embeddings.create(model=EMBED_MODEL, input=chunk),
+            label="openai embeddings")
         # подреждаме по .index за всеки случай — да съвпадне с входа
         for item in sorted(resp.data, key=lambda d: d.index):
             vectors.append(item.embedding)

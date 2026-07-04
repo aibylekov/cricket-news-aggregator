@@ -53,9 +53,11 @@ except ImportError:
 try:
     from . import db
     from . import notify
+    from .retry import retry_call
 except ImportError:  # позволява и директно `python src/combine.py`
     import db
     import notify
+    from retry import retry_call
 
 
 load_dotenv()
@@ -216,11 +218,12 @@ def load_system_prompt(path=PROMPT_FILE):
 
 
 def _client():
+    # max_retries=0 — нашият retry (src/retry.py) е единственият механизъм.
     from openai import OpenAI
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError(
             "Липсва OPENAI_API_KEY. Копирай .env.example в .env и сложи ключа.")
-    return OpenAI()
+    return OpenAI(max_retries=0)
 
 
 def _reasoning_model(model):
@@ -229,23 +232,37 @@ def _reasoning_model(model):
 
 
 def call_model(client, model, system, user, temperature, max_tokens):
-    """Извиква chat.completions устойчиво към разликите между моделите."""
+    """Извиква chat.completions устойчиво към разликите между моделите.
+
+    Всяко извикване е обвито в retry за преходни OpenAI грешки. Адаптацията на
+    параметрите (max_tokens/temperature) остава — тя реагира на ПОСТОЯННИ
+    BadRequest грешки, които retry не повтаря, тъй че няма двойно повтаряне.
+    """
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
     kwargs = {"model": model, "messages": messages,
               "max_completion_tokens": max_tokens}
     if not _reasoning_model(model):
         kwargs["temperature"] = temperature
+
+    def _create(kw):
+        return retry_call(lambda: client.chat.completions.create(**kw),
+                          label="openai chat")
+
     try:
-        return client.chat.completions.create(**kwargs)
+        return _create(kwargs)
     except Exception as ex:
         msg = str(ex).lower()
+        param_issue = ("max_completion_tokens" in msg or "max_tokens" in msg
+                       or "temperature" in msg)
+        if not param_issue:
+            raise   # преходните вече са изчерпани от retry; други → нагоре
         if "max_completion_tokens" in msg or "max_tokens" in msg:
             kwargs.pop("max_completion_tokens", None)
             kwargs["max_tokens"] = max_tokens
         if "temperature" in msg:
             kwargs.pop("temperature", None)
-        return client.chat.completions.create(**kwargs)
+        return _create(kwargs)
 
 
 def parse_output(text):

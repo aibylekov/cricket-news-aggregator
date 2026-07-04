@@ -20,6 +20,7 @@
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
 
@@ -39,8 +40,10 @@ except Exception:
 
 try:
     from .sources.feeds import SOURCES
+    from .retry import retry_call
 except ImportError:  # позволява и директно `python src/collect.py`
     from sources.feeds import SOURCES
+    from retry import retry_call
 
 
 # Браузърска заглавка — за да приличаме на нормален посетител, не на бот.
@@ -62,6 +65,9 @@ _session.cookies.set("SOCS", "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg",
 
 FEED_TIMEOUT = 20      # секунди за изтегляне на една емисия
 RESOLVE_TIMEOUT = 20   # секунди за разрешаване на един Google News линк
+GOOGLE_NEWS_DELAY = 1.5  # пауза преди всяка Google News заявка — 7 бързи
+                         # заявки от един датацентър IP приличат на бот burst
+                         # (и предизвикват 503); малката пауза ги разрежда
 
 
 def _entry_date(entry):
@@ -75,11 +81,17 @@ def _entry_date(entry):
 def fetch_source(name, url, is_google_news):
     """Изтегля една емисия и я връща като списък от единни речници.
 
-    Не лови изключения сам — обвиването в try/except става в collect_all,
-    за да остане изолацията на отказите на едно място.
+    Мрежовата заявка е обвита в retry (преходни грешки — Google News 503,
+    connection/timeout — се повтарят до 3 пъти; 4xx освен 429 се провалят
+    веднага). Не лови изключения сам — обвиването в try/except става в
+    collect_all, за да остане изолацията на отказите на едно място.
     """
-    resp = requests.get(url, headers=HEADERS, timeout=FEED_TIMEOUT)
-    resp.raise_for_status()
+    def _get():
+        resp = requests.get(url, headers=HEADERS, timeout=FEED_TIMEOUT)
+        resp.raise_for_status()   # 5xx/429 → преходно; други 4xx → fail fast
+        return resp
+
+    resp = retry_call(_get, label=f"feed {name}")
 
     parsed = feedparser.parse(resp.content)
     if not parsed.entries:
@@ -201,6 +213,10 @@ def collect_all(resolve_links=True):
     """
     all_articles = []
     for name, url, is_gn in SOURCES:
+        # Разреждаме последователните Google News заявки, за да не приличат на
+        # бот burst от датацентър IP (иначе → 503).
+        if is_gn:
+            time.sleep(GOOGLE_NEWS_DELAY)
         try:
             articles = fetch_source(name, url, is_gn)
         except Exception as ex:

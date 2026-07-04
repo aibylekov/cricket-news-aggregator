@@ -56,9 +56,11 @@ except ImportError:
 try:
     from . import db
     from .collect import HEADERS, resolve_google_news, _looks_resolved
+    from .retry import retry_call
 except ImportError:  # позволява и директно `python src/extract.py`
     import db
     from collect import HEADERS, resolve_google_news, _looks_resolved
+    from retry import retry_call
 
 # .env се зарежда веднъж при import — ключът остава само в средата, не в кода.
 load_dotenv()
@@ -92,9 +94,19 @@ def _clean(html, url):
 
 
 def _fetch_plain(real_url):
-    """Безплатният път: requests + браузърски UA. Връща (body, status)."""
-    try:
+    """Безплатният път: requests + браузърски UA. Връща (body, status).
+
+    Заявката е с retry за преходни грешки (5xx/429/connection/timeout). 403
+    НЕ се повтаря — връща се веднага, за да ескалира към Zyte.
+    """
+    def _get():
         resp = _session.get(real_url, timeout=FETCH_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            resp.raise_for_status()   # преходно → retry
+        return resp
+
+    try:
+        resp = retry_call(_get, label=f"body {real_url[:50]}")
     except requests.Timeout:
         return None, "timeout"
     except requests.RequestException:
@@ -110,15 +122,26 @@ def _fetch_plain(real_url):
 
 
 def _fetch_zyte(real_url):
-    """Резервът: Zyte API (httpResponseBody). Връща (body, status)."""
+    """Резервът: Zyte API (httpResponseBody). Връща (body, status).
+
+    Заявката е с retry за преходни Zyte грешки (5xx/429/connection/timeout);
+    други статуси (напр. 403 при проблем с ключа) се провалят веднага.
+    """
     if not ZYTE_API_KEY:
         return None, "zyte_nokey"
-    try:
+
+    def _post():
         resp = requests.post(
             ZYTE_ENDPOINT, auth=(ZYTE_API_KEY, ""),
             json={"url": real_url, "httpResponseBody": True},
             timeout=ZYTE_TIMEOUT,
         )
+        if resp.status_code == 429 or resp.status_code >= 500:
+            resp.raise_for_status()   # преходно → retry
+        return resp
+
+    try:
+        resp = retry_call(_post, label=f"zyte {real_url[:50]}")
     except requests.Timeout:
         return None, "zyte_timeout"
     except requests.RequestException:

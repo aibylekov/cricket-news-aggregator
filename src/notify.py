@@ -55,8 +55,10 @@ except ImportError:
 
 try:
     from . import db
+    from .retry import retry_call
 except ImportError:  # позволява и директно `python src/notify.py`
     import db
+    from retry import retry_call
 
 
 load_dotenv()
@@ -114,6 +116,20 @@ def build_message(row, cfg):
     return msg
 
 
+def _smtp_connect(cfg):
+    """Отваря SSL/465 връзка и се логва — с retry за преходни грешки.
+
+    Свързването/логинът е най-честата точка на преходен срив. SMTPAuthentication
+    Error (лоша парола) НЕ се повтаря — проваля се веднага.
+    """
+    def _open():
+        server = smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]),
+                                  context=ssl.create_default_context())
+        server.login(cfg["user"], cfg["password"])
+        return server
+    return retry_call(_open, label="smtp connect")
+
+
 def send_unsent(conn, limit=None, dry_run=False):
     """Праща (или dry-run логва) непратените материали. Връща броячи.
 
@@ -159,11 +175,9 @@ def send_unsent(conn, limit=None, dry_run=False):
                 "pending_total": len(pending), "remaining": len(pending),
                 "dry_run_reason": why}
 
-    # Реално пращане през SSL/465.
-    context = ssl.create_default_context()
+    # Реално пращане през SSL/465 (свързването е с retry).
     try:
-        server = smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]), context=context)
-        server.login(cfg["user"], cfg["password"])
+        server = _smtp_connect(cfg)
     except Exception as ex:
         print(f"  ✗ SMTP връзка/логин се провали: {type(ex).__name__}: {ex}")
         return {"sent": 0, "would_send": 0, "errors": len(batch),
@@ -173,7 +187,8 @@ def send_unsent(conn, limit=None, dry_run=False):
     try:
         for row in batch:
             try:
-                server.send_message(build_message(row, cfg))
+                retry_call(lambda: server.send_message(build_message(row, cfg)),
+                           label="smtp send")
                 db.mark_emailed(conn, row["id"])   # маркира → няма повторно пращане
                 conn.commit()
                 sent += 1
@@ -211,10 +226,14 @@ def send_alert(message):
     msg["To"] = cfg["to"]
     msg.set_content(message + "\n")
     try:
-        with smtplib.SMTP_SSL(cfg["host"], int(cfg["port"]),
-                              context=ssl.create_default_context()) as server:
-            server.login(cfg["user"], cfg["password"])
-            server.send_message(msg)
+        server = _smtp_connect(cfg)   # с retry за преходни грешки
+        try:
+            retry_call(lambda: server.send_message(msg), label="smtp alert")
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
         print("  ✓ alert изпратен")
         return True
     except Exception as ex:
