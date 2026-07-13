@@ -15,12 +15,15 @@
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Базата живее в data/ (извън Git — .gitignore изключва *.db).
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "cricket.db"
+# Базата живее в data/ (извън Git — .gitignore изключва *.db). Пътят може да се
+# override-не с CRICKET_DB (удобно за тест върху изолирано копие).
+DB_PATH = Path(os.getenv("CRICKET_DB")
+               or Path(__file__).resolve().parent.parent / "data" / "cricket.db")
 
 
 SCHEMA = """

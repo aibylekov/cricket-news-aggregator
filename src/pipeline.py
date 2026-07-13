@@ -19,6 +19,7 @@
     python -m src.pipeline
 """
 
+import os
 import sys
 import traceback
 
@@ -28,12 +29,12 @@ except Exception:
     pass
 
 try:
-    from . import db, combine, notify
+    from . import db, combine, notify, maintenance
     from .collect import collect_all
     from .match import run_matching
     from .extract import run_extraction
 except ImportError:  # позволява и директно `python src/pipeline.py`
-    import db, combine, notify
+    import db, combine, notify, maintenance
     from collect import collect_all
     from match import run_matching
     from extract import run_extraction
@@ -44,6 +45,10 @@ def run():
     print("\n" + "█" * 70)
     print("  КОНВЕЙЕР (Фаза 7) — едно изпълнение")
     print("█" * 70)
+
+    # Тест на алармата: изкуствен провал по заявка (workflow_dispatch input).
+    if os.getenv("FORCE_FAIL") == "true":
+        raise RuntimeError("FORCE_FAIL=true — изкуствен провал за тест на алармата")
 
     # 1. Събиране + дедупликация/съвпадение (embed само на новите).
     print("\n[1/4] Събиране + съвпадение …")
@@ -60,9 +65,13 @@ def run():
     combine_report = combine.run_combine(conn)
 
     # 4. Ревю-имейл за новите материали (реален send, с предпазен таван).
-    print("\n[4/4] Ревю-имейл …")
+    print("\n[4/5] Ревю-имейл …")
     email_report = notify.send_unsent(conn)
     total_articles, total_matches = db.counts(conn)
+
+    # 5. Поддръжка: архив (append-only) → подрязване → VACUUM (държи базата малка).
+    print("\n[5/5] Архив + подрязване + VACUUM …")
+    maint = maintenance.run_maintenance(conn)
     conn.close()
 
     print("\n" + "─" * 70)
@@ -79,6 +88,9 @@ def run():
     print(f"  Имейли ({kind})   : "
           f"{email_report['sent'] + email_report['would_send']}")
     print(f"  Общо статии / съвпадения : {total_articles} / {total_matches}")
+    print(f"  База: {maint['size_before_mb']:.1f} → {maint['size_after_mb']:.1f} MB"
+          f" | архив: {maint['archive']['articles']} статии, "
+          f"{maint['archive']['combined']} обединени")
     print()
 
 

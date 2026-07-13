@@ -1,19 +1,24 @@
 name: Cricket news pipeline
 
-# Разписание: на всеки 15 минути + ръчно пускане от Actions таба.
+# Разписание: на всеки 15 минути + ръчно пускане (с опция за тест на алармата).
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Изкуствен провал (за тест на имейл-алармата)"
+        type: boolean
+        default: false
 
-# Не пускай два конвейера едновременно — сериализира достъпа до базата и push-а.
+# Не пускай два конвейера едновременно — сериализира достъпа до кеша/базата.
 concurrency:
   group: pipeline
   cancel-in-progress: false
 
-# Нужно за commit-ване на data/cricket.db обратно в хранилището.
+# Вече НЕ commit-ваме база обратно → трябва ни само четене за checkout.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
@@ -29,13 +34,16 @@ jobs:
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-      # Предпазни тавани за едно пускане (Фаза 7) — конфигурируеми тук.
+      # Предпазни тавани и retention за подрязването (конфигурируеми тук).
       MAX_COMBINES_PER_RUN: "10"
       MAX_SENDS_PER_RUN: "10"
+      EMBED_RETENTION_DAYS: "3"
+      ROW_RETENTION_DAYS: "14"
+      FORCE_FAIL: ${{ github.event.inputs.force_fail }}
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout (с историята, за да можем да push-нем базата)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -47,22 +55,64 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── Персистенция чрез CACHE (не git). Rolling key: пазим уникален ключ на
+      # пускане, а restore-keys връща най-скорошния — така състоянието се носи
+      # между run-овете, БЕЗ базата да влиза в хранилището. ──────────────────
+      - name: Restore state from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/cricket.db
+            data/archive.db
+          key: cricket-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cricket-state-
+
+      - name: Seed working DB on first run (cache miss)
+        run: |
+          if [ ! -f data/cricket.db ]; then
+            echo "Няма кеширана база — сидвам от committed data/seed.db"
+            cp data/seed.db data/cricket.db
+          else
+            echo "Възстановена база от кеша ($(du -h data/cricket.db | cut -f1))."
+          fi
+
       - name: Run pipeline
         run: python -m src.pipeline
 
-      - name: Persist DB state (commit back)
-        if: always()          # запазваме състоянието дори при частичен провал
+      - name: Save state to cache
+        if: always()   # запазваме състоянието дори при провал (нищо да не се губи/праща пак)
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/cricket.db
+            data/archive.db
+          key: cricket-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── Архивът като downloadable артефакт. Gate: веднъж дневно (първото
+      # пускане след 00:00 UTC) + винаги при ръчно пускане — за да не трупаме
+      # хиляди артефакти на всеки 15 мин. Ретенция 90 дни (максимумът на free). ──
+      - name: Decide archive upload
+        id: arch
+        if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/cricket.db
-          if git diff --cached --quiet; then
-            echo "Няма промени в базата — нищо за commit."
+          MIN=$((10#$(date -u +%H%M)))
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$MIN" -lt 15 ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "pipeline: persist cricket.db state [skip ci]"
-            git push || (git pull --rebase --autostash && git push)
+            echo "upload=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Upload archive artifact
+        if: always() && steps.arch.outputs.upload == 'true' && hashFiles('data/archive.db') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: cricket-archive
+          path: data/archive.db
+          retention-days: 90
+
+      # Провал → червен run (вградените известия на GitHub) + имейл-аларма.
+      # Английска тема, за да не пада в спам; стъпката е ЧЕРВЕНА, ако не тръгне.
       - name: Alert on failure
         if: failure()
-        run: python -m src.notify --alert "Cricket pipeline run failed. See the GitHub Actions logs for this run."
+        run: python -m src.notify --alert "Cricket pipeline run failed."

@@ -213,18 +213,29 @@ def send_unsent(conn, limit=None, dry_run=False):
 def send_alert(message):
     """Праща кратък имейл-аларма при провал на конвейера (Фаза 7).
 
-    При липсваща SMTP конфигурация само логва (разчита се на вградените
-    известия за провал на GitHub Actions като резерв). Връща True при пращане.
+    Темата е на АНГЛИЙСКИ (кирилицата в темата вероятно е причината старите
+    аларми да не пристигат — попадат в спам, докато ревю-имейлите с английски
+    теми минават). При липсваща SMTP конфигурация само логва. Връща True при
+    успешно пращане.
     """
     cfg = _config()
     if not is_configured(cfg):
         print(f"  (alert dry-run — SMTP не е конфигуриран): {message}")
         return False
+
+    # Контекст от Actions (ако сме там) — за да води директно към лога.
+    run_url = ""
+    server_url = os.getenv("GITHUB_SERVER_URL")
+    repo = os.getenv("GITHUB_REPOSITORY")
+    run_id = os.getenv("GITHUB_RUN_ID")
+    if server_url and repo and run_id:
+        run_url = f"\n\nRun log: {server_url}/{repo}/actions/runs/{run_id}"
+
     msg = EmailMessage()
-    msg["Subject"] = "[cricket-pipeline] ПРОВАЛ на изпълнение"
+    msg["Subject"] = "[cricket-pipeline] ALERT: pipeline run FAILED"
     msg["From"] = cfg["from"]
     msg["To"] = cfg["to"]
-    msg.set_content(message + "\n")
+    msg.set_content(message + run_url + "\n")
     try:
         server = _smtp_connect(cfg)   # с retry за преходни грешки
         try:
@@ -260,8 +271,10 @@ def main():
 
     if args.alert is not None:
         print("\n=== Аларма при провал (Фаза 7) ===\n")
-        send_alert(args.alert)
-        return
+        ok = send_alert(args.alert)
+        # Ако алармата НЕ тръгне, стъпката трябва да е ЧЕРВЕНА (видим сигнал),
+        # а не тихо зелена — иначе провалът остава незабелязан.
+        sys.exit(0 if ok else 1)
 
     conn = db.connect()
 
