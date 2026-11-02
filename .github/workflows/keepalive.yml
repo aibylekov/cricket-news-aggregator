@@ -1,0 +1,46 @@
+name: Keep-alive heartbeat
+
+# Малък heartbeat два пъти седмично (~1-2 tiny commits/седмица), за да НЕ изключи
+# GitHub cron-а при 60 дни „неактивност“ на хранилището.
+#
+# Защо отделен workflow, а не commit в главния конвейер: така главният конвейер
+# остава read-only (persistence през cache). НЕ връщаме per-cycle DB commit-и —
+# именно те докараха 100 MB стената и многодневния срив (виж README root-cause).
+#
+# Commit-ът на github-actions[bot] е реална активност по хранилището и нулира
+# 60-дневния таймер. `[skip ci]` пази от re-trigger (и без това push не стартира
+# нито този workflow, нито конвейера — те тръгват само по schedule/dispatch).
+on:
+  schedule:
+    - cron: "23 7 * * 1,4"   # понеделник и четвъртък, 07:23 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # само за малкия heartbeat commit
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Update heartbeat and commit
+        run: |
+          {
+            date -u +"%Y-%m-%dT%H:%M:%SZ"
+            echo "Седмичен keep-alive, за да не се изключва cron разписанието (60 дни неактивност)."
+          } > .github/heartbeat.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/heartbeat.txt
+          if git diff --cached --quiet; then
+            echo "Няма промяна в heartbeat — нищо за commit."
+          else
+            git commit -m "chore: keep-alive heartbeat [skip ci]"
+            git push
+          fi

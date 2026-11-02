@@ -44,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -59,7 +59,7 @@ jobs:
       # пускане, а restore-keys връща най-скорошния — така състоянието се носи
       # между run-овете, БЕЗ базата да влиза в хранилището. ──────────────────
       - name: Restore state from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             data/cricket.db
@@ -82,7 +82,7 @@ jobs:
 
       - name: Save state to cache
         if: always()   # запазваме състоянието дори при провал (нищо да не се губи/праща пак)
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             data/cricket.db
@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload archive artifact
         if: always() && steps.arch.outputs.upload == 'true' && hashFiles('data/archive.db') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cricket-archive
           path: data/archive.db

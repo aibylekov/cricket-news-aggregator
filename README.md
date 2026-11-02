@@ -50,6 +50,7 @@ RSS емисия (нативна, където минава) или Google News 
 | Състояние / дедупликация | SQLite (заменя крехкото сравняване на JSON файлове) |
 | Персистенция на базата | **GitHub Actions cache** (не git commit) — `data/cricket.db` се restore-ва/save-ва между пусканията с rolling ключ `cricket-state-*`. Началното състояние идва от малкия committnat `data/seed.db` при cache miss. (Причина: commit-back-ът чупеше при > 100 MB — виж root-cause бележката.) |
 | Размер на базата | Всяко пускане: занулява embedding-и > 3 дни (основният размер), трие редове > 14 дни, ненужни на дедупа, и прави **VACUUM**. Държи файла малък (~единици/десетки MB), не расте неограничено |
+| Keep-alive на разписанието | Отделен workflow `keepalive.yml` commit-ва едноредов `.github/heartbeat.txt` 2×/седмица → хранилището не стои „неактивно“ 60 дни и GitHub не изключва cron-а. НЕ връщаме per-cycle DB commit-и (те докараха 100 MB стената) — главният конвейер остава read-only |
 | Архив на новините | Отделен **`data/archive.db`** (append-only, dedup по url) — source, headline, url, published, first_seen, тяло където има + обединените материали. Персистира се като **Actions артефакт** (`cricket-archive`, ретенция 90 дни). НЕ се commit-ва и НИКОГА не се чете от конвейера (само запис). За бъдещ match-prediction проект |
 | Устойчивост | Всеки източник в собствен `try/except` — счупен източник не сваля конвейера |
 | Устойчивост при преходни грешки (Фаза 8) | Общ retry (`src/retry.py`): до 3 опита, експоненциален backoff с jitter (~1s, 2s, 4s), логван. Повтаря САМО преходни грешки (connection/timeout, HTTP 429/5xx, OpenAI APIConnection/APITimeout/RateLimit/InternalServer); проваля се веднага при постоянни (HTTP 4xx освен 429, OpenAI Authentication/BadRequest, SMTP Auth). Обвити: Google News/RSS заявки, OpenAI embeddings+combine, Zyte, SMTP. Retry-ите са вътре в per-source try/except и не заобикалят предпазните тавани. Google News заявки се разреждат с ~1.5s пауза, за да не приличат на бот burst (503) |
@@ -248,6 +249,10 @@ cricket-news-aggregator/
 - [x] **Архив на новините** (`data/archive.db`, append-only, dedup) като Actions артефакт (90 дни)
 - [x] **Поправена аларма при провал** — английска тема (кирилицата падаше в спам); стъпката е
       червена, ако имейлът не тръгне; тестваема с `workflow_dispatch` вход `force_fail`
+- [x] **Keep-alive** (`.github/workflows/keepalive.yml`) — малък heartbeat commit 2×/седмица,
+      за да не изключи GitHub cron-а при 60 дни „неактивност“; главният конвейер остава read-only
+- [x] **Actions на Node 24** — checkout@v7, setup-python@v7, cache@v6, upload-artifact@v7
+      (изчистен е предупреждението за Node 20)
 - [ ] Пускане за известно време и наблюдение (едноседмичен тест без надзор)
 
 ### Root-cause: многодневният срив (2026-07-13)
